@@ -12,11 +12,30 @@ import json
 import time
 import io
 from datetime import datetime
+import re
 
 DB_PATH = Path(__file__).parent.parent.parent / 'data' / 'ecoer_pricing.db'
 
 def get_connection():
     return sqlite3.connect(str(DB_PATH))
+
+def normalize_col(name):
+    """Normalize column name for flexible matching"""
+    name = name.lower().strip()
+    name = re.sub(r'[\s\-_]+', '', name)
+    return name
+
+def auto_match_columns(uploaded_df, expected_columns):
+    """Auto-match uploaded columns to expected columns."""
+    uploaded_cols = list(uploaded_df.columns)
+    norm_uploaded = {normalize_col(c): c for c in uploaded_cols}
+    
+    matched = {}
+    for exp_col in expected_columns:
+        norm_exp = normalize_col(exp_col)
+        matched[exp_col] = norm_uploaded.get(norm_exp)
+    
+    return matched
 
 def login_user(username, password):
     conn = get_connection()
@@ -459,87 +478,80 @@ elif menu == "📋 List Price Management" and user['role'] == 'admin':
                     
                     st.success(f"Read {len(df_up)} rows of data")
                     
+                    # Auto-match columns
+                    expected_up = ['sku', 'model', 'model_number', 'product_name', 'category', 
+                                  'series', 'seer', 'tons', 'refrigerant', 'description', 
+                                  'list_price', 'notes']
+                    col_mapping = auto_match_columns(df_up, expected_up)
+                    
+                    st.info("Auto-detected column mapping:")
+                    mapped_lines = []
+                    for k, v in col_mapping.items():
+                        if v:
+                            mapped_lines.append(f"**{k}** ← {v}")
+                        else:
+                            mapped_lines.append(f"**{k}** ← (not found)")
+                    st.write(" | ".join(mapped_lines))
+                    
                     if st.button("Confirm Price Update", type="primary"):
                         conn = get_connection()
                         cur = conn.cursor()
                         updated = 0
-                        products_updated = 0
                         
-                        not_found = []
                         for _, row in df_up.iterrows():
-                            sku_val = str(row.get('sku', '')).strip()
-                            model_val = str(row.get('Model', '')).strip()
-                            model_number_val = str(row.get('model_number', '')).strip()
-                            
                             prod = None
-                            # Try Multiple Matching Methods
-                            if sku_val:
-                                cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (sku_val,))
+                            for key in ['sku', 'model', 'model_number']:
+                                src_col = col_mapping.get(key)
+                                if not src_col:
+                                    continue
+                                val = str(row.get(src_col, '')).strip()
+                                if not val:
+                                    continue
+                                cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (val,))
                                 prod = cur.fetchone()
-                            if not prod and model_val:
-                                cur.execute("SELECT id FROM ecoer_products WHERE model_number = ?", (model_val,))
+                                if prod:
+                                    break
+                                cur.execute("SELECT id FROM ecoer_products WHERE model_number = ?", (val,))
                                 prod = cur.fetchone()
-                            if not prod and model_number_val:
-                                cur.execute("SELECT id FROM ecoer_products WHERE model_number = ?", (model_number_val,))
-                                prod = cur.fetchone()
-                            if not prod and sku_val:
-                                # Try Removing ABA Suffix
-                                sku_clean = sku_val.replace('ABA', '').strip()
-                                cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (sku_clean,))
-                                prod = cur.fetchone()
+                                if prod:
+                                    break
+                                val_clean = val.replace('ABA', '').strip()
+                                if val_clean != val:
+                                    cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (val_clean,))
+                                    prod = cur.fetchone()
+                                    if prod:
+                                        break
                             
                             if prod:
                                 prod_id = prod[0]
-                                # Update list_price
+                                lp_col = col_mapping.get('list_price')
+                                list_price = float(row[lp_col]) if lp_col and lp_col in row else 0
+                                notes_col = col_mapping.get('notes')
+                                notes_val = str(row[notes_col]) if notes_col and notes_col in row else ''
+                                
                                 cur.execute("""
                                     INSERT OR REPLACE INTO ecoer_list_prices 
                                     (price_list_id, product_id, list_price, notes)
                                     VALUES (?, ?, ?, ?)
-                                """, (selected_pl_id, prod_id, float(row['list_price']), 
-                                      str(row.get('notes', ''))))
+                                """, (selected_pl_id, prod_id, list_price, notes_val))
                                 updated += 1
                                 
-                                # UpdateProductInformation（If Provided）
                                 update_fields = []
                                 update_values = []
-                                if pd.notna(row.get('product_name')) and str(row.get('product_name')).strip():
-                                    update_fields.append("product_name = ?")
-                                    update_values.append(str(row['product_name']).strip())
-                                if pd.notna(row.get('category')) and str(row.get('category')).strip():
-                                    update_fields.append("category = ?")
-                                    update_values.append(str(row['category']).strip())
-                                if pd.notna(row.get('series')) and str(row.get('series')).strip():
-                                    update_fields.append("series = ?")
-                                    update_values.append(str(row['series']).strip())
-                                if pd.notna(row.get('seer')) and str(row.get('seer')).strip():
-                                    update_fields.append("seer = ?")
-                                    update_values.append(str(row['seer']).strip())
-                                if pd.notna(row.get('tons')) and str(row.get('tons')).strip():
-                                    update_fields.append("tons = ?")
-                                    update_values.append(str(row['tons']).strip())
-                                if pd.notna(row.get('refrigerant')) and str(row.get('refrigerant')).strip():
-                                    update_fields.append("refrigerant = ?")
-                                    update_values.append(str(row['refrigerant']).strip())
-                                if pd.notna(row.get('description')) and str(row.get('description')).strip():
-                                    update_fields.append("description = ?")
-                                    update_values.append(str(row['description']).strip())
-                                if pd.notna(row.get('model_number')) and str(row.get('model_number')).strip():
-                                    update_fields.append("model_number = ?")
-                                    update_values.append(str(row['model_number']).strip())
+                                for prod_col in ['product_name', 'category', 'series', 'seer', 'tons',
+                                              'refrigerant', 'description', 'model_number']:
+                                    src_col = col_mapping.get(prod_col)
+                                    if src_col and src_col in row and pd.notna(row[src_col]) and str(row[src_col]).strip():
+                                        update_fields.append(f"{prod_col} = ?")
+                                        update_values.append(str(row[src_col]).strip())
                                 
                                 if update_fields:
                                     update_values.append(prod_id)
                                     cur.execute(f"UPDATE ecoer_products SET {', '.join(update_fields)} WHERE id = ?", update_values)
-                                    products_updated += 1
-                            else:
-                                not_found.append(sku_val or model_val or model_number_val)
-                        
-                        if not_found:
-                            st.warning(f"The following {len(not_found)} products were not found: {', '.join(not_found[:10])}{'...' if len(not_found) > 10 else ''}")
                         
                         conn.commit()
                         conn.close()
-                        st.success(f"Updated {updated} product prices! ({products_updated} product info updated)")
+                        st.success(f"Updated {updated} product prices!")
                         st.balloons()
                         time.sleep(1)
                         st.rerun()
@@ -713,77 +725,102 @@ elif menu == "📥 Bulk Upload/Download" and user['role'] == 'admin':
                     st.success(f"Read {len(df)} rows")
                     st.dataframe(df.head())
                     
+                    # Auto-match columns
+                    expected = ['sku', 'model', 'model_number', 'product_name', 'category', 
+                               'series', 'seer', 'tons', 'refrigerant', 'description', 
+                               'list_price', 'notes']
+                    col_mapping = auto_match_columns(df, expected)
+                    
+                    # Show mapping results
+                    st.info("Auto-detected column mapping:")
+                    mapped_lines = []
+                    for k, v in col_mapping.items():
+                        if v:
+                            mapped_lines.append(f"**{k}** ← {v}")
+                        else:
+                            mapped_lines.append(f"**{k}** ← (not found)")
+                    st.write(" | ".join(mapped_lines))
+                    
+                    # Allow manual override for key columns
+                    with st.expander("Manual column mapping override"):
+                        key_cols = ['sku', 'model', 'model_number', 'list_price', 'notes']
+                        for key in key_cols:
+                            options = ['(not mapped)'] + list(df.columns)
+                            current = col_mapping.get(key, '')
+                            idx = options.index(current) if current in options else 0
+                            selected = st.selectbox(f"Map '{key}' to:", options, index=idx, key=f"map_{key}")
+                            col_mapping[key] = None if selected == '(not mapped)' else selected
+                    
                     if st.button("Confirm Import", type="primary"):
                         conn = get_connection()
                         cur = conn.cursor()
                         imported = 0
-                        
                         not_found = []
+                        
                         for _, row in df.iterrows():
-                            sku_val = str(row.get('sku', '')).strip()
-                            model_val = str(row.get('Model', '')).strip()
-                            model_number_val = str(row.get('model_number', '')).strip()
-                            
+                            # Try multiple product ID columns
                             prod = None
-                            if sku_val:
-                                cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (sku_val,))
+                            for key in ['sku', 'model', 'model_number']:
+                                src_col = col_mapping.get(key)
+                                if not src_col:
+                                    continue
+                                val = str(row.get(src_col, '')).strip()
+                                if not val:
+                                    continue
+                                cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (val,))
                                 prod = cur.fetchone()
-                            if not prod and model_val:
-                                cur.execute("SELECT id FROM ecoer_products WHERE model_number = ?", (model_val,))
+                                if prod:
+                                    break
+                                cur.execute("SELECT id FROM ecoer_products WHERE model_number = ?", (val,))
                                 prod = cur.fetchone()
-                            if not prod and model_number_val:
-                                cur.execute("SELECT id FROM ecoer_products WHERE model_number = ?", (model_number_val,))
-                                prod = cur.fetchone()
-                            if not prod and sku_val:
-                                sku_clean = sku_val.replace('ABA', '').strip()
-                                cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (sku_clean,))
-                                prod = cur.fetchone()
+                                if prod:
+                                    break
+                                # Try without ABA suffix
+                                val_clean = val.replace('ABA', '').strip()
+                                if val_clean != val:
+                                    cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (val_clean,))
+                                    prod = cur.fetchone()
+                                    if prod:
+                                        break
                             
                             if prod:
                                 prod_id = prod[0]
+                                lp_col = col_mapping.get('list_price')
+                                list_price = float(row[lp_col]) if lp_col and lp_col in row else 0
+                                notes_col = col_mapping.get('notes')
+                                notes_val = str(row[notes_col]) if notes_col and notes_col in row else ''
+                                
                                 cur.execute("""
                                     INSERT OR REPLACE INTO ecoer_list_prices
                                     (price_list_id, product_id, list_price, notes)
                                     VALUES (?, ?, ?, ?)
-                                """, (pl_id, prod_id, float(row['list_price']), str(row.get('notes', ''))))
+                                """, (pl_id, prod_id, list_price, notes_val))
                                 imported += 1
                                 
-                                # UpdateProductInformation（If Provided）
+                                # Update product info if provided
                                 update_fields = []
                                 update_values = []
-                                if pd.notna(row.get('product_name')) and str(row.get('product_name')).strip():
-                                    update_fields.append("product_name = ?")
-                                    update_values.append(str(row['product_name']).strip())
-                                if pd.notna(row.get('category')) and str(row.get('category')).strip():
-                                    update_fields.append("category = ?")
-                                    update_values.append(str(row['category']).strip())
-                                if pd.notna(row.get('series')) and str(row.get('series')).strip():
-                                    update_fields.append("series = ?")
-                                    update_values.append(str(row['series']).strip())
-                                if pd.notna(row.get('seer')) and str(row.get('seer')).strip():
-                                    update_fields.append("seer = ?")
-                                    update_values.append(str(row['seer']).strip())
-                                if pd.notna(row.get('tons')) and str(row.get('tons')).strip():
-                                    update_fields.append("tons = ?")
-                                    update_values.append(str(row['tons']).strip())
-                                if pd.notna(row.get('refrigerant')) and str(row.get('refrigerant')).strip():
-                                    update_fields.append("refrigerant = ?")
-                                    update_values.append(str(row['refrigerant']).strip())
-                                if pd.notna(row.get('description')) and str(row.get('description')).strip():
-                                    update_fields.append("description = ?")
-                                    update_values.append(str(row['description']).strip())
-                                if pd.notna(row.get('model_number')) and str(row.get('model_number')).strip():
-                                    update_fields.append("model_number = ?")
-                                    update_values.append(str(row['model_number']).strip())
+                                for prod_col in ['product_name', 'category', 'series', 'seer', 'tons', 
+                                                'refrigerant', 'description', 'model_number']:
+                                    src_col = col_mapping.get(prod_col)
+                                    if src_col and src_col in row and pd.notna(row[src_col]) and str(row[src_col]).strip():
+                                        update_fields.append(f"{prod_col} = ?")
+                                        update_values.append(str(row[src_col]).strip())
                                 
                                 if update_fields:
                                     update_values.append(prod_id)
                                     cur.execute(f"UPDATE ecoer_products SET {', '.join(update_fields)} WHERE id = ?", update_values)
                             else:
-                                not_found.append(sku_val or model_val or model_number_val)
+                                for key in ['sku', 'model', 'model_number']:
+                                    src_col = col_mapping.get(key)
+                                    if src_col:
+                                        val = str(row.get(src_col, '')).strip()
+                                        if val:
+                                            not_found.append(val)
+                                            break
                         
                         if not_found:
-                            st.warning(f"The following {len(not_found)} products were not found: {', '.join(not_found[:10])}{'...' if len(not_found) > 10 else ''}")
+                            st.warning(f"{len(not_found)} products not found: {', '.join(not_found[:10])}{'...' if len(not_found) > 10 else ''}")
                         
                         conn.commit()
                         conn.close()
@@ -834,12 +871,9 @@ elif menu == "📥 Bulk Upload/Download" and user['role'] == 'admin':
     
     with tab3:
         st.subheader("Bulk Update Customer Product Modifier")
-        st.markdown("""
-        **Excel Format:**
-        | customer_code | sku | modifier | notes |
-        |---------------|-----|----------|-------|
-        | C001 | EODA19H-2436 | 0.85 | VIP Discount |
-        """)
+        
+        # Expected columns for auto-match
+        expected_cust = ['customer_code', 'customer_name', 'sku', 'modifier', 'notes']
         
         uploaded = st.file_uploader("Select Modifier File", type=['xlsx', 'csv'])
         if uploaded:
@@ -852,24 +886,68 @@ elif menu == "📥 Bulk Upload/Download" and user['role'] == 'admin':
                 st.success(f"Read {len(df)} rows")
                 st.dataframe(df.head())
                 
+                # Auto-match columns
+                col_mapping = auto_match_columns(df, expected_cust)
+                
+                st.info("Auto-detected column mapping:")
+                mapped_lines = []
+                for k, v in col_mapping.items():
+                    if v:
+                        mapped_lines.append(f"**{k}** ← {v}")
+                    else:
+                        mapped_lines.append(f"**{k}** ← (not found)")
+                st.write(" | ".join(mapped_lines))
+                
+                # Manual override
+                with st.expander("Manual column mapping override"):
+                    for key in ['customer_code', 'sku', 'modifier', 'notes']:
+                        options = ['(not mapped)'] + list(df.columns)
+                        current = col_mapping.get(key, '')
+                        idx = options.index(current) if current in options else 0
+                        selected = st.selectbox(f"Map '{key}' to:", options, index=idx, key=f"cust_map_{key}")
+                        col_mapping[key] = None if selected == '(not mapped)' else selected
+                
                 if st.button("Confirm Import Modifier", type="primary"):
                     conn = get_connection()
                     cur = conn.cursor()
                     imported = 0
                     
                     for _, row in df.iterrows():
-                        cur.execute("SELECT id FROM ecoer_customers WHERE customer_code = ?", (str(row['customer_code']).strip(),))
+                        cc_col = col_mapping.get('customer_code')
+                        sku_col = col_mapping.get('sku')
+                        mod_col = col_mapping.get('modifier')
+                        notes_col = col_mapping.get('notes')
+                        
+                        cust_val = str(row[cc_col]).strip() if cc_col and cc_col in row else ''
+                        sku_val = str(row[sku_col]).strip() if sku_col and sku_col in row else ''
+                        
+                        if not cust_val or not sku_val:
+                            continue
+                        
+                        cur.execute("SELECT id FROM ecoer_customers WHERE customer_code = ?", (cust_val,))
                         cust = cur.fetchone()
                         
-                        cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (str(row['sku']).strip(),))
-                        prod = cur.fetchone()
+                        # Try SKU or model number
+                        prod = None
+                        if sku_val:
+                            cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (sku_val,))
+                            prod = cur.fetchone()
+                            if not prod:
+                                cur.execute("SELECT id FROM ecoer_products WHERE model_number = ?", (sku_val,))
+                                prod = cur.fetchone()
+                                if not prod:
+                                    sku_clean = sku_val.replace('ABA', '').strip()
+                                    cur.execute("SELECT id FROM ecoer_products WHERE sku = ?", (sku_clean,))
+                                    prod = cur.fetchone()
                         
                         if cust and prod:
+                            mod_val = float(row[mod_col]) if mod_col and mod_col in row else 1.0
+                            notes_val = str(row[notes_col]) if notes_col and notes_col in row else ''
                             cur.execute("""
                                 INSERT OR REPLACE INTO ecoer_customer_product_modifiers
                                 (customer_id, product_id, modifier, notes)
                                 VALUES (?, ?, ?, ?)
-                            """, (cust[0], prod[0], float(row['modifier']), str(row.get('notes', ''))))
+                            """, (cust[0], prod[0], mod_val, notes_val))
                             imported += 1
                     
                     conn.commit()
